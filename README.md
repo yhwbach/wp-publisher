@@ -1,85 +1,89 @@
-# WP Bulk Publisher
+# wp-publisher
 
-Section 2 of the SEO Automation assessment: validate a CSV of AI-generated articles and schedule the valid ones on
-WordPress through the REST API, with Yoast SEO fields, pacing, retries, idempotency and a per-row report.
+Takes a CSV of articles, validates each row, and schedules the good ones on a WordPress site through the REST API.
+Yoast SEO title, meta description and focus keyword are set on each post. Every run writes a report showing what
+happened to each row.
 
-`content_pipeline/` holds supporting code for the Section 3/4 answers (pgvector internal-link retrieval, QA gates,
-mem0 client memory). It isn't needed to run the publisher.
-
-## Layout
-
-```
-publisher/
-  settings.py      pydantic-settings (WP_*, CLIENT_ID, ALLOWED_CATEGORIES, DATABASE_URL)
-  schemas.py       ArticleRow (validation), WordPressPost (REST payload), RowResult (report row)
-  wordpress.py     async httpx client: App Password auth, pacing, retries/backoff, Retry-After
-  runner.py        BatchPublisher: validate, idempotency check, POST, record; circuit breaker
-  ledger.py        PublishLedger SQLModel + async repository (optional, enabled by DATABASE_URL)
-  cli.py           python -m publisher
-database/
-  session.py       async engine / AsyncSession factory
-  migrations/      Alembic (async template)
-content_pipeline/  pgvector link pool, QA gates (claims, tone drift, duplicates), mem0 memory
-wordpress/yoast-rest-meta.php   mu-plugin: makes Yoast meta writable over REST (required)
-mock_wp_server.py  local fake of /wp-json/wp/v2 with injected 503s and a 400
-articles.csv       sample rows covering every validation rule
-```
+I wrote this for the Section 2 task of an SEO automation assessment. The `content_pipeline/` package is extra code
+backing some of my written answers (internal link suggestions with pgvector, QA checks, per-client memory with mem0).
+The publisher doesn't depend on it.
 
 ## Setup
 
+You'll need Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+
 ```bash
-uv sync                       # add --extra pipeline for content_pipeline (mem0, openai, numpy)
-cp .env.template .env         # fill in WP_URL / WP_USER / WP_APP_PASSWORD
+uv sync
+cp .env.template .env
 ```
 
-On the WordPress site: create an Editor-role user, generate an Application Password (Users → Profile), and drop
-`wordpress/yoast-rest-meta.php` into `wp-content/mu-plugins/`.
+Then fill in `WP_URL`, `WP_USER` and `WP_APP_PASSWORD` in `.env`.
 
-## Run
+On the WordPress side:
+
+1. Create a user with the Editor role for the script.
+2. Generate an Application Password for it under Users, Profile.
+3. Copy `wordpress/yoast-rest-meta.php` into `wp-content/mu-plugins/`. Yoast doesn't allow writing its fields over
+   REST by default, so without this the SEO fields are silently dropped.
+
+## Usage
+
+Check the CSV without posting anything:
 
 ```bash
-uv run python -m publisher articles.csv --dry-run                 # validate only
+uv run python -m publisher articles.csv --dry-run
+```
+
+Publish and save a report (CSV or JSON, based on the extension):
+
+```bash
 uv run python -m publisher articles.csv --report reports/report.csv
-uv run python -m publisher articles.csv --report reports/report.json
 ```
 
-Exit code 1 if any row failed at the API level, 2 if the WordPress settings are invalid.
+The exit code is 1 if WordPress rejected any row and 2 if the settings are missing or invalid.
 
-### Try it locally against the mock
+Each row in the report ends up with one of these statuses:
+
+- `posted`: created as a scheduled post
+- `skipped_existing`: a post with that slug already exists, so it was left alone
+- `validation_failed`: the row had problems and was never sent; `reasons` lists all of them
+- `api_failed`: WordPress returned an error; the status code and message are in the report
+- `dry_run_valid`: only with `--dry-run`, the row would have been posted
+
+Running the same CSV twice is safe. Before posting, the script looks the slug up on the site and skips it if it's
+already there.
+
+## Trying it without a real site
+
+`mock_wp_server.py` fakes the parts of the WordPress API the script uses. It returns a couple of 503s for one slug
+to exercise the retries, and a 400 for another.
 
 ```bash
 uv run python mock_wp_server.py --port 8089 &
+
 WP_URL=http://localhost:8089 WP_ALLOW_HTTP=true WP_USER=bot WP_APP_PASSWORD=secret \
-WP_MIN_REQUEST_INTERVAL_SECONDS=0.1 uv run python -m publisher articles.csv
+  WP_MIN_REQUEST_INTERVAL_SECONDS=0.1 uv run python -m publisher articles.csv
 ```
 
-Expected: 4 posted (one after two 503 retries), 6 validation_failed, 1 api_failed (400). A second run reports the
-4 as `skipped_existing`.
+With the sample CSV you should get 4 posted, 6 failing validation and 1 rejected by the API. Run it again and the 4
+come back as `skipped_existing`.
 
-### With the Postgres ledger
+## Optional Postgres ledger
+
+If `DATABASE_URL` is set, every published post is also recorded in Postgres, so later runs can skip it without
+asking WordPress.
 
 ```bash
-docker compose up -d                       # pgvector/pgvector:pg17 on :5440
+docker compose up -d
 export DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5440/seo_pipeline
 uv run alembic upgrade head
-uv run python -m publisher articles.csv
 ```
 
-New migrations: change the SQLModel models, then `uv run alembic revision --autogenerate -m "..."` and review the
-generated file.
+Migrations are managed with Alembic. After changing a model, generate a new one with
+`uv run alembic revision --autogenerate -m "describe the change"` and check it over before applying it.
 
 ## Tests
 
 ```bash
 uv run pytest
 ```
-
-## Report statuses
-
-| status              | meaning                                                         |
-|---------------------|-----------------------------------------------------------------|
-| `posted`            | created as a scheduled (`future`) post                          |
-| `skipped_existing`  | slug already exists on the site or in the ledger, not duplicated |
-| `validation_failed` | row rejected before any API call; `reasons` lists every problem |
-| `api_failed`        | WordPress error; `http_status` + `code: message` in `reasons`   |
-| `dry_run_valid`     | `--dry-run` only: row would be posted                           |
